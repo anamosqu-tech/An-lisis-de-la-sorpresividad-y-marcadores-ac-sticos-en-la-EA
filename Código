@@ -1,0 +1,156 @@
+# -*- coding: utf-8 -*-
+import os
+import textgrid
+import spacy
+import torch
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from pathlib import Path
+from docx import Document
+from docx.shared import Inches, Cm
+from transformers import GPT2LMHeadModel, GPT2TokenizerFast
+from wordfreq import zipf_frequency
+
+# =========================================================
+# CONFIGURACIÓN
+# =========================================================
+BASE_DIR = Path.cwd()
+TEXTGRID_DIR = BASE_DIR / "textgrids"
+OUTPUT_DIR = BASE_DIR / "salidas"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+SUBJECT_COLORS = {"C1": "#A0D2EB", "C2": "#4F81BD", "EA1": "#F9D1A5", "EA2": "#E68383"}
+sns.set_theme(style="whitegrid")
+
+try:
+    nlp = spacy.load("es_core_news_sm")
+    tokenizer = GPT2TokenizerFast.from_pretrained("datificate/gpt2-small-spanish")
+    model = GPT2LMHeadModel.from_pretrained("datificate/gpt2-small-spanish")
+    model.eval()
+except Exception as e:
+    print(f"Error cargando modelos: {e}")
+
+# =========================================================
+# FUNCIONES DE CÁLCULO LINGÜÍSTICO (TABLA 2)
+# =========================================================
+
+def calcular_honore(tokens):
+    N = len(tokens)
+    V = len(set(tokens))
+    frecuencias = pd.Series(tokens).value_counts()
+    V1 = sum(frecuencias == 1)
+    if V == V1: return 0 # Evitar división por cero
+    return 100 * np.log(N) / (1 - (V1 / V))
+
+def analizar_linguistica_completa(texto):
+    if not texto or len(texto.split()) < 2: return {}
+    
+    doc = nlp(texto)
+    tokens = [t.text.lower() for t in doc if t.is_alpha]
+    N = len(tokens)
+    if N == 0: return {}
+
+    # Clasificación de palabras para porcentajes
+    rellenos = ["eh", "este", "pues", "mira", "bueno"] # Lista genérica de fillers
+    vacias = [t.text.lower() for t in doc if t.is_stop]
+    
+    # Cálculo de métricas solicitadas
+    metrics = {
+        "Total de palabras": N,
+        "Rellenos (%)": round((len([t for t in tokens if t in rellenos]) / N) * 100, 2),
+        "Palabras vacías (%)": round((len(vacias) / N) * 100, 2),
+        "Artículos definidos (%)": round((len([t for t in doc if t.tag_ == "DET__Definite=Def"]) / N) * 100, 2),
+        "Artículos indefinidos (%)": round((len([t for t in doc if t.tag_ == "DET__Definite=Ind"]) / N) * 100, 2),
+        "Pronombres (%)": round((len([t for t in doc if t.pos_ == "PRON"]) / N) * 100, 2),
+        "Sustantivos (%)": round((len([t for t in doc if t.pos_ == "NOUN"]) / N) * 100, 2),
+        "Verbos (%)": round((len([t for t in doc if t.pos_ == "VERB"]) / N) * 100, 2),
+        "Palabras de contenido (%)": round((len([t for t in doc if t.pos_ in ["NOUN", "VERB", "ADJ", "ADV"]]) / N) * 100, 2),
+        "Ratio type-token": round(len(set(tokens)) / N, 2),
+        "Estadístico de Honoré": round(calcular_honore(tokens), 2),
+        "Frecuencia léxica (mediana log)": round(np.median([np.log10(zipf_frequency(t, 'es') + 1e-10) for t in tokens]), 3)
+    }
+
+    # Sorpresividad (GPT-2)
+    inputs = tokenizer(texto, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(**inputs, labels=inputs["input_ids"])
+        nll = outputs.loss.item()
+    metrics["Mediana sorpresividad"] = round(nll, 2)
+    
+    return metrics
+
+# =========================================================
+# PROCESAMIENTO TEXTGRID Y EJECUCIÓN
+# =========================================================
+
+def main():
+    if not TEXTGRID_DIR.exists(): return
+    
+    archivos = list(TEXTGRID_DIR.glob("*.TextGrid"))
+    datos_finales = []
+
+    for f in archivos:
+        print(f"➜ Procesando: {f.name}")
+        tg = textgrid.TextGrid.fromFile(str(f))
+        tier = next((t for t in tg.tiers if t.name.lower() in ["texto", "speech"]), None)
+        
+        if tier:
+            habla, silencio, pausas, texto_lista = 0.0, 0.0, 0, []
+            for interval in tier:
+                dur = interval.maxTime - interval.minTime
+                if interval.mark.strip().lower() in ["silent", "sil", ""]:
+                    silencio += dur
+                    pausas += 1
+                else:
+                    habla += dur
+                    texto_lista.append(interval.mark.strip())
+            
+            transcripcion = " ".join(texto_lista)
+            # Unir métricas acústicas con las lingüísticas calculadas
+            m_ling = analizar_linguistica_completa(transcripcion)
+            
+            res = {
+                "Sujeto": f.stem,
+                "Tiempo habla neta (s)": round(habla, 2),
+                "Tiempo silencio (s)": round(silencio, 2),
+                "Habla efectiva (%)": round((habla/(habla+silencio))*100, 2) if (habla+silencio)>0 else 0,
+                "Transcripcion": transcripcion
+            }
+            res.update(m_ling)
+            datos_finales.append(res)
+
+    if not datos_finales: return
+
+    df = pd.DataFrame(datos_finales)
+    df.to_excel(OUTPUT_DIR / "Analisis_Completo_Calculado.xlsx", index=False)
+
+    # Gráfico de la Tabla 2
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    metrics_plot = ["Estadístico de Honoré", "Mediana sorpresividad"]
+    for i, m in enumerate(metrics_plot):
+        if m in df.columns:
+            sns.barplot(data=df, x="Sujeto", y=m, ax=axes[i], palette=SUBJECT_COLORS, edgecolor="black")
+            axes[i].set_title(m, fontweight="bold")
+    
+    plt.savefig(OUTPUT_DIR / "graficas_tabla2.png")
+
+    # Word
+    doc = Document()
+    doc.add_heading('Informe Automático: Métricas Lingüísticas (Tabla 2)', 0)
+    for _, row in df.iterrows():
+        doc.add_heading(f"Sujeto: {row['Sujeto']}", level=1)
+        doc.add_paragraph(f"Texto analizado: {row['Transcripcion']}")
+        # Crear una pequeña lista con los resultados de la Tabla 2
+        p = doc.add_paragraph()
+        p.add_run(f"Honoré: {row.get('Estadístico de Honoré')} | ").bold = True
+        p.add_run(f"Sorpresividad: {row.get('Mediana sorpresividad')} | ")
+        p.add_run(f"TTR: {row.get('Ratio type-token')}")
+
+    doc.add_picture(str(OUTPUT_DIR / "graficas_tabla2.png"), width=Inches(6))
+    doc.save(OUTPUT_DIR / "Reporte_Tabla2_Calculado.docx")
+    print(f"✅ ¡Completado! Archivos en {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    main()
